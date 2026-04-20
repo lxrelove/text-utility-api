@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from transformers import pipeline
-import os, re
+import os, re, httpx
 from collections import Counter
 
 app = FastAPI(
@@ -11,9 +10,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
 API_KEY_NAME = "X-RapidAPI-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 VALID_API_KEYS = os.environ.get("VALID_API_KEYS", "dev-test-key").split(",")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_API = "https://api-inference.huggingface.co/models"
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 def verify_key(api_key: str = Security(api_key_header)):
     if api_key not in VALID_API_KEYS:
@@ -21,31 +24,7 @@ def verify_key(api_key: str = Security(api_key_header)):
                             detail="Invalid or missing API key.")
     return api_key
 
-_summarizer = None
-_sentiment  = None
-_lang       = None
-
-def get_summarizer():
-    global _summarizer
-    if _summarizer is None:
-        _summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    return _summarizer
-
-def get_sentiment():
-    global _sentiment
-    if _sentiment is None:
-        _sentiment = pipeline("sentiment-analysis",
-                              model="distilbert-base-uncased-finetuned-sst-2-english")
-    return _sentiment
-
-def get_lang():
-    global _lang
-    if _lang is None:
-        _lang = pipeline("text-classification",
-                         model="papluca/xlm-roberta-base-language-detection")
-    return _lang
-
-# Simple keyword extraction — no extra dependencies needed
+# ── Keyword extraction (no ML needed) ────────────────────────────────────────
 STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with",
              "is","are","was","were","be","been","being","have","has","had","do",
              "does","did","will","would","could","should","may","might","this",
@@ -57,6 +36,7 @@ def extract_keywords(text: str, top_n: int = 10) -> list[str]:
     filtered = [w for w in words if w not in STOPWORDS]
     return [w for w, _ in Counter(filtered).most_common(top_n)]
 
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class TextIn(BaseModel):
     text: str
 
@@ -74,6 +54,16 @@ class LangOut(BaseModel):
     detected_language: str
     confidence: float
 
+# ── HuggingFace helper ────────────────────────────────────────────────────────
+def hf_post(model: str, payload: dict):
+    r = httpx.post(f"{HF_API}/{model}", headers=HEADERS, json=payload, timeout=30)
+    if r.status_code == 503:
+        raise HTTPException(status_code=503, detail="AI model is loading, retry in 20 seconds.")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"HuggingFace error: {r.text}")
+    return r.json()
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health", tags=["Status"])
 def health():
     return {"status": "ok"}
@@ -83,14 +73,17 @@ def health():
 def summarize(body: TextIn, _: str = Security(verify_key)):
     if len(body.text.split()) < 30:
         raise HTTPException(status_code=400, detail="Text must be at least 30 words.")
-    result = get_summarizer()(body.text, max_length=130, min_length=30, do_sample=False)
+    result = hf_post("sshleifer/distilbart-cnn-12-6",
+                     {"inputs": body.text, "parameters": {"max_length": 130, "min_length": 30}})
     return {"summary": result[0]["summary_text"]}
 
 @app.post("/sentiment", response_model=SentimentOut, tags=["Text Tools"],
           summary="Detect positive or negative sentiment.")
 def sentiment(body: TextIn, _: str = Security(verify_key)):
-    result = get_sentiment()(body.text[:512])
-    return {"label": result[0]["label"], "score": round(result[0]["score"], 4)}
+    result = hf_post("distilbert-base-uncased-finetuned-sst-2-english",
+                     {"inputs": body.text[:512]})
+    best = max(result[0], key=lambda x: x["score"])
+    return {"label": best["label"], "score": round(best["score"], 4)}
 
 @app.post("/keywords", response_model=KeywordsOut, tags=["Text Tools"],
           summary="Extract top keywords from text.")
@@ -100,5 +93,7 @@ def keywords(body: TextIn, _: str = Security(verify_key)):
 @app.post("/detect-language", response_model=LangOut, tags=["Text Tools"],
           summary="Detect the language of a text.")
 def detect_language(body: TextIn, _: str = Security(verify_key)):
-    result = get_lang()(body.text[:256])
-    return {"detected_language": result[0]["label"], "confidence": round(result[0]["score"], 4)}
+    result = hf_post("papluca/xlm-roberta-base-language-detection",
+                     {"inputs": body.text[:256]})
+    best = max(result[0], key=lambda x: x["score"])
+    return {"detected_language": best["label"], "confidence": round(best["score"], 4)}
